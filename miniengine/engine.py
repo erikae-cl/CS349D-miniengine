@@ -24,6 +24,7 @@ import logging
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from miniengine.core import Request
@@ -164,6 +165,81 @@ class Engine:
         return sample_token(
             logits[:, -1, :], request.sampling_params, request.output_ids
         )
+
+    @torch.inference_mode()
+    def batched_decode(self, requests):
+        """
+        runs one step of batched decode, assume stuff is prefilled,
+        we do padding to the longest sequence in the batch and utilize
+        masks to make sure we do not attend to pads.
+        """
+        batch_size = len(requests)
+        num_layers = len(requests[0].kv_cache)
+
+        # last tokens from the request become the input to our model
+        last_tokens = [[r.output_ids[-1]] for r in requests]
+        # long since tokens are ints
+        input_ids = torch.tensor(last_tokens, dtype=torch.long, device=self.device)
+
+        # prepare for padding
+        cache_lens = [r.kv_cache[0][0].shape[2] for r in requests]
+        max_cache_len = max(cache_lens) # need to pad to max
+        position_ids = torch.tensor(
+            [[L] for L in cache_lens], dtype=torch.long, device=self.device
+        ) # need this to pass into the model since RoPE needs actual position not padded etc.
+
+        # pad the differences, right now i guess we remake this is there a better version? liek orca ig we will still have 
+        # fragmentation but rebuild is not craxy
+        # something we could look into.
+        batched_kv_caches= []
+        # remember that EACH LAYER has its own KV, so totla kv cache is quite multidim..
+        for layer_idx in range(num_layers):
+            ks, vs = [], []
+            for req, L in zip(requests, cache_lens):
+                k, v = req.kv_cache[layer_idx]
+                pad = max_cache_len - L
+                if pad > 0:
+                   # dimension left pad, hidd dim right pad, seq left, seq right (args)
+                    k = F.pad(k, (0, 0, 0, pad))
+                    v = F.pad(v, (0, 0, 0, pad))
+                ks.append(k)
+                vs.append(v)
+            batched_kv_caches.append((torch.cat(ks, dim=0), torch.cat(vs, dim=0)))
+
+        # +1 due to new token that we run on 
+        mask = torch.zeros(
+            batch_size, 1, 1, max_cache_len + 1,
+            dtype=self.dtype, device=self.device,
+        )
+        # mask so attention score is 0 
+        for i, L in enumerate(cache_lens):
+            if L < max_cache_len: # dont nedd 
+                mask[i, :, :, L:max_cache_len] = float("-inf")
+
+        # forward pass
+        logits, new_kv_caches = self.model(
+            input_ids, position_ids, batched_kv_caches, attention_mask=mask
+        )
+
+        # store back similar to what the spec says!
+        for i, (req, L) in enumerate(zip(requests, cache_lens)):
+            new_cache = []
+            for layer_idx in range(num_layers): # prolly some fancy slicing but doing layer by layer for readibilty
+                k_full, v_full = new_kv_caches[layer_idx]
+                k_real = torch.cat(
+                    [k_full[i:i+1, :, :L, :], k_full[i:i+1, :, -1:, :]], dim=2
+                )
+                v_real = torch.cat(
+                    [v_full[i:i+1, :, :L, :], v_full[i:i+1, :, -1:, :]], dim=2
+                )
+                new_cache.append((k_real, v_real))
+            req.kv_cache = new_cache
+
+        # logit dimension [batch, seq =1, vocab]
+        return [
+            sample_token(logits[i:i+1, -1, :], r.sampling_params, r.output_ids)
+            for i, r in enumerate(requests)
+        ]
 
     def is_stop_token(self, token_id: int) -> bool:
         return token_id in self.stop_token_ids

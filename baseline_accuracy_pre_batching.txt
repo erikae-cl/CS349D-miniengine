@@ -1,0 +1,36 @@
+just storing some 
+
+
+============================================================
+  Accuracy Benchmark
+  Dataset     : mmlu
+  Samples     : 10
+  Max tokens  : 32
+  Concurrency : 1
+  Server      : http://localhost:8000
+============================================================
+
+Loading dataset...
+  Loaded 10 samples
+
+Running evaluation...
+  [10/10] accuracy=20.0%  latency=1.7s
+
+============================================================
+  MMLU Accuracy Report
+  Samples    : 10
+  Correct    : 2
+  Accuracy   : 20.0%
+  Avg latency: 2.15s
+============================================================
+
+  Sample incorrect predictions (5 of 8):
+    Gold=0  Pred=None  Output: To determine the energy of the photon emitted during the transition from $ n = 3...
+    Gold=1  Pred=3  Output: Answer: **D. left and right submandibular lymph nodes.**...
+    Gold=2  Pred=0  Output: A. brigadier general
+
+**Answer: A**...
+    Gold=0  Pred=3  Output: Answer: **D. the use of irrigation to produce enough food**  
+
+**Explanation:** ...
+    Gold=2  Pred=0  Output: A....
