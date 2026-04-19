@@ -21,6 +21,7 @@ Design note:
 from __future__ import annotations
 
 import logging
+from collections import deque
 from typing import Any
 
 import torch
@@ -35,16 +36,20 @@ logger = logging.getLogger(__name__)
 
 
 class Engine:
-    """Bare-bone model wrapper for single-request prefill and decode."""
+    """Model wrapper with orca like managing in terms of fixed allocation of memory."""
 
     def __init__(
         self,
         model_path: str,
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
+        max_running = 16,
+        max_seq_len = 2048,
     ):
         self.device = device
         self.dtype = dtype
+        self.max_running = max_running
+        self.max_seq_len = max_seq_len
 
         # ── Tokenizer (still from HF — it's just a tokenizer) ──────────
         logger.info("Loading tokenizer from %s …", model_path)
@@ -71,6 +76,44 @@ class Engine:
         self.model = CausalLM(config)
         load_weights(self.model, model_path, dtype=dtype, device=device)
         self.model.eval()
+
+        # kv cache "pool"
+        # dimensions is persistent (max_running, kv_heads, max_seq_len, head_dim) tensor
+        # we need this per layer, per k and v. Each running request owns one slot row.
+        # TODO adjust the hyper params of max_running, seq length based on mem capcities and workload
+        self.num_layers = config.num_hidden_layers
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.kv_pool = [
+            (
+                torch.zeros(
+                    max_running, self.num_kv_heads, max_seq_len, self.head_dim,
+                    dtype=dtype, device=device,
+                ),
+                torch.zeros(
+                    max_running, self.num_kv_heads, max_seq_len, self.head_dim,
+                    dtype=dtype, device=device,
+                ),
+            )
+            for i in range(self.num_layers)
+        ]
+
+        self.slot_to_request = {}
+        self.next_free_slot = 0
+
+        pool_bytes = (
+            2  # K + V
+            * self.num_layers
+            * max_running
+            * self.num_kv_heads
+            * max_seq_len
+            * self.head_dim
+            * torch.tensor([], dtype=dtype).element_size()
+        )
+        logger.info(
+            "kv pool stats:  max_running=%d, max_seq_len=%d, totalspace=%.2f GB",
+            max_running, max_seq_len, pool_bytes / 1024**3,
+        )
 
         # ── Stop tokens ─────────────────────────────────────────────────
         self.stop_token_ids: set[int] = set()
@@ -113,33 +156,89 @@ class Engine:
         """Decode a single token id back to a string."""
         return self.tokenizer.decode([token_id], skip_special_tokens=True)
 
+    # slot management, with compaction
+
+    def alloc_slot(self, request):
+        slot = self.next_free_slot
+        self.slot_to_request[slot] = request
+        self.next_free_slot += 1
+        return slot
+
+    def free_slot(self, slot_idx):
+        last = self.next_free_slot - 1
+        if slot_idx != last:
+            moved_req = self.slot_to_request[last]
+            L = moved_req.cache_len  # only copy valid portion
+            # only move last to this and free last easy!
+            for k_pool, v_pool in self.kv_pool:
+                k_pool[slot_idx, :, :L, :].copy_(k_pool[last, :, :L, :])
+                v_pool[slot_idx, :, :L, :].copy_(v_pool[last, :, :L, :])
+            moved_req.slot_idx = slot_idx
+            self.slot_to_request[slot_idx] = moved_req
+        self.slot_to_request.pop(last, None)
+        self.next_free_slot -= 1
+
+    def _write_kv_to_pool(self, kv_caches, slot_idx, start_pos, seq_len):
+        end_pos = start_pos + seq_len
+        for layer_idx, (k, v) in enumerate(kv_caches):
+            # k, v shape: (1, kv_heads, seq_len, head_dim)
+            self.kv_pool[layer_idx][0][slot_idx, :, start_pos:end_pos, :] = k.squeeze(0)
+            self.kv_pool[layer_idx][1][slot_idx, :, start_pos:end_pos, :] = v.squeeze(0)
+
+    def _read_pool_slice(self, slot_idx, length):
+        return [
+            (
+                self.kv_pool[layer_idx][0][slot_idx:slot_idx+1, :, :length, :],
+                self.kv_pool[layer_idx][1][slot_idx:slot_idx+1, :, :length, :],
+            )
+            for layer_idx in range(self.num_layers)
+        ]
+
     # ── Forward passes ──────────────────────────────────────────────────
 
     @torch.inference_mode()
     def prefill(self, request: Request) -> int:
         """
-        Run the prefill phase for one request.
-
-        Processes the full prompt in a single forward pass, stores the
-        resulting KV cache on the request, and samples the first output
-        token.
-
-        Returns:
-            The first generated token id.
+        process the full prompt in one forward pass, write the resulting kv
+        into the request's pool slot, and sample the first output token.
         """
-        input_ids = torch.tensor(
-            [request.input_ids], dtype=torch.long, device=self.device
-        )
-        seq_len = input_ids.shape[1]
-        position_ids = torch.arange(seq_len, device=self.device).unsqueeze(0)
+        # Validate length up front so we don't allocate a slot we can't fill.
+        # Reserve 1 token of headroom for the first generated token.
+        seq_len = len(request.input_ids)
+        if seq_len + 1 > self.max_seq_len:
+            raise ValueError(
+                f"Prompt length {seq_len} (+1 for first decode) exceeds "
+                f"max_seq_len={self.max_seq_len}. Increase --max-seq-len."
+            )
 
-        logits, kv_caches = self.model(input_ids, position_ids, kv_caches=None)
-        request.kv_cache = kv_caches
+        allocated_now = False
+        if request.slot_idx is None:
+            request.slot_idx = self.alloc_slot(request)
+            request.cache_len = 0
+            allocated_now = True
 
-        # Sample from the last position
-        return sample_token(
-            logits[:, -1, :], request.sampling_params, request.output_ids
-        )
+        try:
+            input_ids = torch.tensor(
+                [request.input_ids], dtype=torch.long, device=self.device
+            )
+            position_ids = torch.arange(seq_len, device=self.device).unsqueeze(0)
+
+            logits, kv_caches = self.model(input_ids, position_ids, kv_caches=None)
+
+            self._write_kv_to_pool(kv_caches, request.slot_idx, start_pos=0, seq_len=seq_len)
+            request.cache_len = seq_len
+
+            return sample_token(
+                logits[:, -1, :], request.sampling_params, request.output_ids
+            )
+        except Exception:
+            # If anything failed after allocation, return the slot so the next
+            # request doesn't see a phantom holder of this slot.
+            if allocated_now:
+                self.free_slot(request.slot_idx)
+                request.slot_idx = None
+                request.cache_len = 0
+            raise
 
     @torch.inference_mode()
     def decode_step(self, request: Request) -> int:
@@ -152,15 +251,24 @@ class Engine:
         Returns:
             The next generated token id.
         """
+        slot = request.slot_idx
+        L = request.cache_len
+
         input_ids = torch.tensor(
             [[request.output_ids[-1]]], dtype=torch.long, device=self.device
         )
-        # Position = current KV cache length (= num tokens already processed)
-        cache_len = request.kv_cache[0][0].shape[2]  # layer 0, key tensor, seq dim
-        position_ids = torch.tensor([[cache_len]], device=self.device)
+        position_ids = torch.tensor([[L]], dtype=torch.long, device=self.device)
 
-        logits, kv_caches = self.model(input_ids, position_ids, kv_caches=request.kv_cache)
-        request.kv_cache = kv_caches
+        # Vvew the request's existing cache out of the pool.
+        kv_view = self._read_pool_slice(slot, length=L)
+
+        logits, new_kv = self.model(input_ids, position_ids, kv_caches=kv_view)
+        
+        # append only 1 instead of whole!
+        for layer_idx, (k_full, v_full) in enumerate(new_kv):
+            self.kv_pool[layer_idx][0][slot, :, L, :] = k_full[0, :, -1, :]
+            self.kv_pool[layer_idx][1][slot, :, L, :] = v_full[0, :, -1, :]
+        request.cache_len = L + 1
 
         return sample_token(
             logits[:, -1, :], request.sampling_params, request.output_ids
@@ -172,48 +280,46 @@ class Engine:
         runs one step of batched decode, assume stuff is prefilled,
         we do padding to the longest sequence in the batch and utilize
         masks to make sure we do not attend to pads.
+        compaction used to reduce copies and do more reference passing
         """
-        batch_size = len(requests)
-        num_layers = len(requests[0].kv_cache)
+        # sort by slot_idx so the i-th batch row corresponds to pool slot i.
+        # like a scatter
+        order = sorted(range(len(requests)), key=lambda i: requests[i].slot_idx)
+        sorted_reqs = [requests[i] for i in order]
+        batch_size = len(sorted_reqs)
 
-        # last tokens from the request become the input to our model
-        last_tokens = [[r.output_ids[-1]] for r in requests]
-        # long since tokens are ints
+        # after sort, slots should be 0,1,..n-1 thanks to compaction.
+        # asserting just in case 
+        assert all(r.slot_idx == j for j, r in enumerate(sorted_reqs)), (
+            "asseert failed debug needed"
+            f"Got: {[r.slot_idx for r in sorted_reqs]}"
+        )
+
+        last_tokens = [[r.output_ids[-1]] for r in sorted_reqs]
         input_ids = torch.tensor(last_tokens, dtype=torch.long, device=self.device)
 
-        # prepare for padding
-        cache_lens = [r.kv_cache[0][0].shape[2] for r in requests]
-        max_cache_len = max(cache_lens) # need to pad to max
-        position_ids = torch.tensor(
-            [[L] for L in cache_lens], dtype=torch.long, device=self.device
-        ) # need this to pass into the model since RoPE needs actual position not padded etc.
+        cache_lens = [r.cache_len for r in sorted_reqs]
+        max_cache_len = max(cache_lens)
+        cache_lens_t = torch.tensor(cache_lens, dtype=torch.long, device=self.device)
+        position_ids = cache_lens_t.unsqueeze(1)  # (batch_size, 1)
 
-        # pad the differences, right now i guess we remake this is there a better version? liek orca ig we will still have 
-        # fragmentation but rebuild is not craxy
-        # something we could look into.
-        batched_kv_caches= []
-        # remember that EACH LAYER has its own KV, so totla kv cache is quite multidim..
-        for layer_idx in range(num_layers):
-            ks, vs = [], []
-            for req, L in zip(requests, cache_lens):
-                k, v = req.kv_cache[layer_idx]
-                pad = max_cache_len - L
-                if pad > 0:
-                   # dimension left pad, hidd dim right pad, seq left, seq right (args)
-                    k = F.pad(k, (0, 0, 0, pad))
-                    v = F.pad(v, (0, 0, 0, pad))
-                ks.append(k)
-                vs.append(v)
-            batched_kv_caches.append((torch.cat(ks, dim=0), torch.cat(vs, dim=0)))
+        # view of tensors
+        batched_kv_caches = []
+        for layer_idx in range(self.num_layers):
+            pool_k, pool_v = self.kv_pool[layer_idx]
+            batched_kv_caches.append((
+                pool_k[:batch_size, :, :max_cache_len, :],
+                pool_v[:batch_size, :, :max_cache_len, :],
+            ))
 
-        # +1 due to new token that we run on 
+        # mask: (batch_size, 1, 1, max_cache_len + 1). +1 is the new token slot.
         mask = torch.zeros(
             batch_size, 1, 1, max_cache_len + 1,
             dtype=self.dtype, device=self.device,
         )
         # mask so attention score is 0 
         for i, L in enumerate(cache_lens):
-            if L < max_cache_len: # dont nedd 
+            if L < max_cache_len:
                 mask[i, :, :, L:max_cache_len] = float("-inf")
 
         # forward pass
@@ -221,25 +327,28 @@ class Engine:
             input_ids, position_ids, batched_kv_caches, attention_mask=mask
         )
 
-        # store back similar to what the spec says!
-        for i, (req, L) in enumerate(zip(requests, cache_lens)):
-            new_cache = []
-            for layer_idx in range(num_layers): # prolly some fancy slicing but doing layer by layer for readibilty
-                k_full, v_full = new_kv_caches[layer_idx]
-                k_real = torch.cat(
-                    [k_full[i:i+1, :, :L, :], k_full[i:i+1, :, -1:, :]], dim=2
-                )
-                v_real = torch.cat(
-                    [v_full[i:i+1, :, :L, :], v_full[i:i+1, :, -1:, :]], dim=2
-                )
-                new_cache.append((k_real, v_real))
-            req.kv_cache = new_cache
+        # scatter the new kv token back to each slot's cache_len position.
+        slots_t = torch.arange(batch_size, dtype=torch.long, device=self.device)
+        for layer_idx in range(self.num_layers):
+            new_k, new_v = new_kv_caches[layer_idx]
+            new_k_token = new_k[:, :, -1, :]
+            new_v_token = new_v[:, :, -1, :]
+            pool_k, pool_v = self.kv_pool[layer_idx]
+            pool_k[slots_t, :, cache_lens_t, :] = new_k_token
+            pool_v[slots_t, :, cache_lens_t, :] = new_v_token
 
-        # logit dimension [batch, seq =1, vocab]
-        return [
+        for r in sorted_reqs:
+            r.cache_len += 1
+
+        # Sample in sorted order, then map back to caller's input order.
+        sorted_tokens = [
             sample_token(logits[i:i+1, -1, :], r.sampling_params, r.output_ids)
-            for i, r in enumerate(requests)
+            for i, r in enumerate(sorted_reqs)
         ]
+        result = [None] * len(requests)
+        for sorted_i, orig_i in enumerate(order):
+            result[orig_i] = sorted_tokens[sorted_i]
+        return result
 
     def is_stop_token(self, token_id: int) -> bool:
         return token_id in self.stop_token_ids

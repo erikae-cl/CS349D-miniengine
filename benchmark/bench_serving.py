@@ -137,10 +137,14 @@ def prepare_requests(
             ids = tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True,
             )
+        # from ed post
+        if hasattr(ids, "keys") and "input_ids" in ids:
+            ids = ids["input_ids"]
+
+        actual_input_len = len(ids)
 
         if len(ids) > req_input_len:
             # Truncate: decode back to text from truncated ids
-            # Keep the chat template structure by truncating user content
             truncated_ids = ids[:req_input_len]
             truncated_text = tokenizer.decode(truncated_ids, skip_special_tokens=True)
             messages = [{"role": "user", "content": truncated_text}]
@@ -161,12 +165,12 @@ def prepare_requests(
                     test_ids = tokenizer.apply_chat_template(
                         msgs, tokenize=True, add_generation_prompt=True,
                     )
+                if hasattr(test_ids, "keys") and "input_ids" in test_ids:
+                    test_ids = test_ids["input_ids"]
                 if len(test_ids) >= req_input_len:
                     messages = msgs
                     actual_input_len = len(test_ids)
                     break
-        else:
-            actual_input_len = len(ids)
 
         requests.append({
             "messages": [{"role": m["role"], "content": m["content"]} for m in messages],

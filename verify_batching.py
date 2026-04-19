@@ -36,7 +36,7 @@ def make_request(engine, prompt, max_tokens):
 
 def run_unbatched(engine, prompt, max_tokens):
     req = make_request(engine, prompt, max_tokens)
-    tokens= []
+    tokens = []
 
     tok = engine.prefill(req)
     req.output_ids.append(tok)
@@ -47,6 +47,9 @@ def run_unbatched(engine, prompt, max_tokens):
         req.output_ids.append(tok)
         tokens.append(tok)
 
+    # Return the slot so it can be reused for the next run
+    if req.slot_idx is not None:
+        engine.free_slot(req.slot_idx)
     return tokens
 
 # put both the prompts here
@@ -65,7 +68,7 @@ def run_batched(engine, prompts, max_tokens):
         live_reqs = [reqs[i] for i in active]
         new_tokens = engine.batched_decode(live_reqs)
 
-        still_active= []
+        still_active = []
         for slot, (req_idx, tok) in enumerate(zip(active, new_tokens)):
             reqs[req_idx].output_ids.append(tok)
             outputs[req_idx].append(tok)
@@ -77,6 +80,10 @@ def run_batched(engine, prompts, max_tokens):
                 still_active.append(req_idx)
         active = still_active
 
+    # Free all slots before returning
+    for r in reqs:
+        if r.slot_idx is not None:
+            engine.free_slot(r.slot_idx)
     return outputs
 
 
@@ -104,7 +111,11 @@ def main():
     dtype = getattr(torch, args.dtype)
 
     print(f"loading engine  model={args.model}  device={args.device}  dtype={args.dtype}")
-    engine = Engine(model_path=args.model, dtype=dtype, device=args.device)
+    # works on local we should increase this on VM
+    engine = Engine(
+        model_path=args.model, dtype=dtype, device=args.device,
+        max_running=4, max_seq_len=128,
+    )
 
     # unbatch
     print("baseline")

@@ -54,8 +54,11 @@ class Request:
     status: RequestStatus = RequestStatus.WAITING
     arrival_time: float = field(default_factory=time.time)
 
-    # Per-request KV cache (set by Engine during prefill, updated on each decode)
-    kv_cache: Any = None
+    # our cache is now a slot based one similar to DBs with fixed records ig
+    # index is the index owned by request, length is valid tokens
+    # set by prefill, updated by decode, released when done
+    slot_idx = None
+    cache_len = 0
 
     # Streaming output channel — scheduler pushes, server consumes
     token_queue: queue.Queue = field(default_factory=queue.Queue)

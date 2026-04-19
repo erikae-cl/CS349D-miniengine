@@ -140,31 +140,40 @@ class Scheduler:
             slot_cap = self.max_running
 
         admitted: list[Request] = []
-        with self._lock:
+        with self._lock: # waiting is shared hence under lock
             while (len(self.running) + len(admitted) < slot_cap) and self.waiting:
                 admitted.append(self.waiting.popleft())
 
-        # ── prefill each admitted request individually ──────────────────
+        # ── prefill each admitted request individually ───────
         for req in admitted:
             req.status = RequestStatus.RUNNING
-            token_id = self.engine.prefill(req)
-            req.output_ids.append(token_id)
-            self._stream_token(req, token_id)
-
         # edge case of EOS at first end of prefil
         # so making sure they do not enter the batched decode below.
-        for req in admitted:
-            if self._check_finished(req, req.output_ids[-1]):
-                self._finish_request(req, finished)
-            else:
-                self.running.append(req)
+            try:
+                token_id = self.engine.prefill(req)
+                req.output_ids.append(token_id)
+                self._stream_token(req, token_id)
+                if self._check_finished(req, token_id):
+                    self._finish_request(req, finished)
+                else:
+                    self.running.append(req)
+            except Exception:
+                logger.exception("prefill failed for request %s", req.request_id)
+                self._fail_request(req, finished)
 
         # batch call
         if self.running:
-            next_tokens = self.engine.batched_decode(self.running)
-            for req, token_id in zip(self.running, next_tokens):
-                req.output_ids.append(token_id)
-                self._stream_token(req, token_id)
+            try:
+                next_tokens = self.engine.batched_decode(self.running)
+                for req, token_id in zip(self.running, next_tokens):
+                    req.output_ids.append(token_id)
+                    self._stream_token(req, token_id)
+            except Exception:
+                logger.exception("batched_decode failed; retiring all running requests")
+                for req in list(self.running):
+                    self._fail_request(req, finished)
+                self.running = []
+                return finished
 
         # retire finished stuff
         still_running = []
@@ -193,9 +202,11 @@ class Scheduler:
         req.token_queue.put(TokenOutput(token_id=token_id, token_text=text, finished=False))
 
     def _finish_request(self, req: Request, finished_list: list[Request]) -> None:
-        """Mark a request as finished and free its resources."""
+        """Mark a request as finished and return its KV pool slot."""
         req.status = RequestStatus.FINISHED
-        req.kv_cache = None  # release GPU memory
+        if req.slot_idx is not None:
+            self.engine.free_slot(req.slot_idx)
+            req.slot_idx = None
         req.token_queue.put(TokenOutput(token_id=-1, token_text="", finished=True))
         finished_list.append(req)
 
@@ -208,3 +219,16 @@ class Scheduler:
             len(self.running),
             len(self.waiting),
         )
+
+    def _fail_request(self, req, finished_list):
+        if req in self.running:
+            self.running.remove(req)
+        if req.slot_idx is not None:
+            try:
+                self.engine.free_slot(req.slot_idx)
+            except Exception:
+                logger.exception(
+                    "free_slot failed during _fail_request for %s", req.request_id
+                )
+            req.slot_idx = None
+        self._finish_request(req, finished_list)

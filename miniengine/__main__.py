@@ -50,10 +50,16 @@ def parse_args() -> argparse.Namespace:
         default="continuous",
         choices=["naive", "static", "continuous"],
         help=(
-            "naive: 1 request at a time (sequential baseline). "
+            "naive: 1 request at a time."
             "static: batched, drain-before-refill. "
-            "continuous: batched, admit-when-slot-free (default)."
+            "continuous: batched, admit-when-free."
         ),
+    )
+    p.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=2048,
+        help="Per-slot KV cache capacity (max input + output tokens per request)",
     )
     return p.parse_args()
 
@@ -71,7 +77,13 @@ def main() -> None:
     dtype = getattr(torch, args.dtype)
     logger.info("Initializing engine  model=%s  dtype=%s", args.model, args.dtype)
 
-    engine = Engine(model_path=args.model, dtype=dtype, device=args.device)
+    engine = Engine(
+        model_path=args.model,
+        dtype=dtype,
+        device=args.device,
+        max_running=args.max_running,
+        max_seq_len=args.max_seq_len,
+    )
     sched = Scheduler(
         engine=engine,
         max_running=args.max_running,
