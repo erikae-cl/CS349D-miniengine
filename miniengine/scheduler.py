@@ -54,13 +54,17 @@ class Scheduler:
         engine: Engine,
         max_running: int = 16,
         scheduling_mode: str = "continuous",
+        token_budget: int = 1024,
     ):
-        assert scheduling_mode in ("naive", "static", "continuous"), (
-            f'please use a proper mode ("naive", "static", "continuous"'
+        assert scheduling_mode in ("naive", "static", "continuous", "mixed"), (
+            f'please use a proper mode ("naive", "static", "continuous", "mixed"). '
+            f'got: {scheduling_mode!r}'
         )
         self.engine = engine
         self.max_running = max_running
         self.scheduling_mode = scheduling_mode
+        # total tokens per step in mixed iteration
+        self.token_budget = token_budget
 
         # Queues
         self.waiting: deque[Request] = deque()
@@ -118,15 +122,14 @@ class Scheduler:
     # ── Scheduling step ─────────────────────────────────────────────────
 
     def step(self) -> list[Request]:
+        """one scheduling iteration. dispatches to mixed-mode if enabled."""
+        if self.scheduling_mode == "mixed":
+            return self._step_mixed()
+        return self._step_classic()
+
+    def _step_classic(self) -> list[Request]:
         """
-        one scheduling iteration of continuous batching.
-
-        loop stpes:
-        1. admit up to max_running and prefill individually
-            a. will work on the abtched prefill+decode mixed inference later tiem permitting
-        2. decode batched
-        3. retire finished requests.
-
+        naive / static / continuous: per-request prefill, then batched decode.
         Returns list of requests that finished in this step.
         """
         finished: list[Request] = []
@@ -179,6 +182,94 @@ class Scheduler:
         still_running = []
         for req in self.running:
             if self._check_finished(req, req.output_ids[-1]):
+                self._finish_request(req, finished)
+            else:
+                still_running.append(req)
+        self.running = still_running
+
+        return finished
+
+    def _step_mixed(self):
+        """
+        mixed prefill+decode in one forward pass per step.
+
+        each step:
+        1. admit waiting requests up to max_running (max_running still due to bounded memory). 
+        allocate slot, do NOT prefill yet since prefill happens in chunks via mixed_step.
+        2. build the ops list under self.token_budget. decoding requests
+        always go in first (1 token each). remaining budget goes
+        to prefill chunks of requests still mid-prefill, ideally no starvation since EOS hits
+        3. call engine.mixed_step.
+        4. process per-op results: append sampled tokens, stream them and retire finished requests.
+        """
+        finished = []
+
+        # admit waiting requests, allocate slots, no prefill.
+        with self._lock:
+            while len(self.running) < self.max_running and self.waiting:
+                req = self.waiting.popleft()
+                req.status = RequestStatus.RUNNING
+                req.slot_idx = self.engine.alloc_slot(req)
+                req.cache_len = 0
+                self.running.append(req)
+
+        if not self.running:
+            return finished
+
+        # build ops under the token budget. Decoders first (cheap), then
+        # prefill chunks fill the remainder.
+        ops = []
+        used = 0 # used budget
+
+        # decoders (cache_len >= num_input_tokens means prefill is done).
+        for req in self.running:
+            if req.cache_len >= req.num_input_tokens:
+                ops.append((req, 1))
+                used += 1
+
+        # prefillers (cache_len < num_input_tokens). take whatever budget remains.
+        for req in self.running:
+            if used >= self.token_budget:
+                break
+            if req.cache_len < req.num_input_tokens:
+                remaining_to_prefill = req.num_input_tokens - req.cache_len
+                chunk = min(remaining_to_prefill, self.token_budget - used)
+                if chunk > 0:
+                    ops.append((req, chunk))
+                    used += chunk
+
+        # n_decoders = sum(1 for r, _ in ops if r.cache_len >= r.num_input_tokens)
+        # n_prefill_chunks = len(ops) - n_decoders
+        # if n_prefill_chunks > 0:
+        #     chunk_sizes = [n for r, n in ops if r.cache_len < r.num_input_tokens]
+        #     logger.info(
+        #         "mixed_step: decoders=%d  prefill_chunks=%d  chunk_sizes=%s  total=%d/%d",
+        #         n_decoders, n_prefill_chunks, chunk_sizes, used, self.token_budget,
+        #     )
+
+        # run mixed_step.
+        try:
+            results = self.engine.mixed_step(ops)
+        except Exception:
+            logger.exception(
+                "mixed_step failed; retiring all requests in this batch"
+            )
+            for req in list(self.running):
+                self._fail_request(req, finished)
+            self.running = []
+            return finished
+
+        # process results where we append tokens for requests that completed prefill
+        # or are decoding (mixed_step returns none for still-prefilling).
+        for (req, n), tok in zip(ops, results):
+            if tok is not None:
+                req.output_ids.append(tok)
+                self._stream_token(req, tok)
+
+        # retire finished requests.
+        still_running = []
+        for req in self.running:
+            if req.output_ids and self._check_finished(req, req.output_ids[-1]):
                 self._finish_request(req, finished)
             else:
                 still_running.append(req)

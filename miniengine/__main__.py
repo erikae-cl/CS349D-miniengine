@@ -48,18 +48,25 @@ def parse_args() -> argparse.Namespace:
         "--scheduling-mode",
         type=str,
         default="continuous",
-        choices=["naive", "static", "continuous"],
+        choices=["naive", "static", "continuous", "mixed"],
         help=(
-            "naive: 1 request at a time."
+            "naive: 1 request at a time. "
             "static: batched, drain-before-refill. "
-            "continuous: batched, admit-when-free."
+            "continuous: batched, admit-when-free. "
+            "mixed: chunked prefill + decode in one forward pass."
         ),
     )
     p.add_argument(
         "--max-seq-len",
         type=int,
         default=2048,
-        help="Per-slot KV cache capacity (max input + output tokens per request)",
+        help="pre allocated kv cache limit",
+    )
+    p.add_argument(
+        "--token-budget",
+        type=int,
+        default=1024,
+        help="total tokens per mixed_step forward pass (only in mixed mode)",
     )
     return p.parse_args()
 
@@ -88,6 +95,7 @@ def main() -> None:
         engine=engine,
         max_running=args.max_running,
         scheduling_mode=args.scheduling_mode,
+        token_budget=args.token_budget,
     )
 
     # Wire up the server module globals

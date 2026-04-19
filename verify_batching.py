@@ -36,7 +36,7 @@ def make_request(engine, prompt, max_tokens):
 
 def run_unbatched(engine, prompt, max_tokens):
     req = make_request(engine, prompt, max_tokens)
-    tokens = []
+    tokens= []
 
     tok = engine.prefill(req)
     req.output_ids.append(tok)
@@ -47,7 +47,6 @@ def run_unbatched(engine, prompt, max_tokens):
         req.output_ids.append(tok)
         tokens.append(tok)
 
-    # Return the slot so it can be reused for the next run
     if req.slot_idx is not None:
         engine.free_slot(req.slot_idx)
     return tokens
@@ -68,7 +67,7 @@ def run_batched(engine, prompts, max_tokens):
         live_reqs = [reqs[i] for i in active]
         new_tokens = engine.batched_decode(live_reqs)
 
-        still_active = []
+        still_active= []
         for slot, (req_idx, tok) in enumerate(zip(active, new_tokens)):
             reqs[req_idx].output_ids.append(tok)
             outputs[req_idx].append(tok)
@@ -80,7 +79,6 @@ def run_batched(engine, prompts, max_tokens):
                 still_active.append(req_idx)
         active = still_active
 
-    # Free all slots before returning
     for r in reqs:
         if r.slot_idx is not None:
             engine.free_slot(r.slot_idx)
@@ -133,9 +131,66 @@ def main():
         return 0
 
     test = run_batched(engine, PROMPTS, args.max_tokens)
-    ok = compare(gold, test)
-    print(f"{'batched output matches gold' if ok else 'not match'}")
-    return 0 if ok else 1
+    ok_batched = compare(gold, test)
+    print(f"{'batched output matches gold' if ok_batched else 'not match'}")
+
+    if hasattr(engine, "mixed_step"):
+        all_mixed_ok = True
+        for chunk in (1, 4, 16):
+            print(f"mixed run, prefill_chunk_size={chunk}")
+            test_mixed = run_mixed(engine, PROMPTS, args.max_tokens, chunk)
+            ok = compare(gold, test_mixed)
+            print(f"  {'mixed output matches gold' if ok else 'not match'}")
+            all_mixed_ok = all_mixed_ok and ok
+        ok_overall = ok_batched and all_mixed_ok
+    else:
+        ok_overall = ok_batched
+
+    return 0 if ok_overall else 1
+
+
+def run_mixed(engine, prompts, max_tokens, prefill_chunk_size):
+    reqs = [make_request(engine, p, max_tokens) for p in prompts]
+    outputs = [[] for _ in prompts]
+
+    # allocate slots up front; mixed_step assumes they're already there.
+    for r in reqs:
+        r.slot_idx = engine.alloc_slot(r)
+        r.cache_len = 0
+
+    active = list(range(len(reqs)))
+    while active:
+        ops = []
+        for i in active:
+            r = reqs[i]
+            if r.cache_len < r.num_input_tokens:
+                remaining = r.num_input_tokens - r.cache_len
+                ops.append((r, min(remaining, prefill_chunk_size)))
+            else:
+                ops.append((r, 1))
+
+        results = engine.mixed_step(ops)
+
+        new_active = []
+        for active_pos, (req_idx, (op, tok)) in enumerate(
+            zip(active, zip(ops, results))
+        ):
+            req = ops[active_pos][0]
+            if tok is not None:
+                req.output_ids.append(tok)
+                outputs[req_idx].append(tok)
+                if (
+                    len(outputs[req_idx]) >= max_tokens
+                    or engine.is_stop_token(tok)
+                ):
+                    continue
+            new_active.append(req_idx)
+        active = new_active
+
+    for r in reqs:
+        if r.slot_idx is not None:
+            engine.free_slot(r.slot_idx)
+    return outputs
 
 
 if __name__ == "__main__":

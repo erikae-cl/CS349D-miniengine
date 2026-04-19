@@ -350,5 +350,136 @@ class Engine:
             result[orig_i] = sorted_tokens[sorted_i]
         return result
 
+    @torch.inference_mode()
+    def mixed_step(self, ops):
+        """
+        mixed prefill+decode in a single forward pass.
+
+        the forward pass uses batch=1 with all requests' new tokens
+        concatenated along seq, plus a block-diagonal causal mask that
+        keeps each request's queries restricted to its own keys.
+
+        returns: per-op next token id, or None if the request is still
+        prefilling (didn't finish prefill in this step).
+        """
+        if not ops:
+            return []
+
+        num_new_list = [n for r, n in ops]
+        cache_lens = [r.cache_len for r, n in ops]
+        slot_indices = [r.slot_idx for r, n in ops]
+        total_new = sum(num_new_list)
+        total_cached = sum(cache_lens)
+
+        # concatenate input tokens. for prefilling requests pull next
+        # chunk from input_ids. for decoding, use last output token.
+        flat_tokens = []
+        for req, n in ops:
+            if req.cache_len < req.num_input_tokens:
+                start = req.cache_len
+                end = start + n
+                flat_tokens.extend(req.input_ids[start:end])
+            else:
+                assert n == 1, "decoding requests must have num_new=1"
+                flat_tokens.append(req.output_ids[-1])
+        input_ids = torch.tensor([flat_tokens], dtype=torch.long, device=self.device)
+
+        # each token's actual position in its OWN request.
+        flat_positions = []
+        for req, n in ops:
+            for p in range(n):
+                flat_positions.append(req.cache_len + p)
+        position_ids = torch.tensor([flat_positions], dtype=torch.long, device=self.device)
+
+        # gather cached kv from the pool, concat per layer along seq.
+        cached_kv_caches = []
+        for layer_idx in range(self.num_layers):
+            pool_k, pool_v = self.kv_pool[layer_idx]
+            ks = [pool_k[s:s+1, :, :L, :] for s, L in zip(slot_indices, cache_lens)]
+            vs = [pool_v[s:s+1, :, :L, :] for s, L in zip(slot_indices, cache_lens)]
+            cached_kv_caches.append((torch.cat(ks, dim=2), torch.cat(vs, dim=2)))
+
+        mask = self._build_mixed_mask(num_new_list, cache_lens)
+
+        # forward
+        logits, new_kv_caches = self.model(
+            input_ids, position_ids, cached_kv_caches, attention_mask=mask
+        )
+        # logits: (1, total_new, vocab)
+        # new_kv per layer: (1, kv_heads, total_cached + total_new, head_dim)
+
+        # update kv pool
+        for layer_idx in range(self.num_layers):
+            new_k, new_v = new_kv_caches[layer_idx]
+            new_k_only = new_k[:, :, total_cached:, :]   # (1, kv_heads, total_new, head_dim)
+            new_v_only = new_v[:, :, total_cached:, :]
+            pool_k, pool_v = self.kv_pool[layer_idx]
+            offset = 0
+            for slot, L, n in zip(slot_indices, cache_lens, num_new_list):
+                pool_k[slot, :, L:L+n, :] = new_k_only[0, :, offset:offset+n, :]
+                pool_v[slot, :, L:L+n, :] = new_v_only[0, :, offset:offset+n, :]
+                offset += n
+
+        # update cache_len + sample tokens for finished-prefill requests.
+        results = []
+        offset = 0
+        for req, n in ops:
+            req.cache_len += n
+            if req.cache_len >= req.num_input_tokens:
+                # prefill done (or already was decoding) so sample at the LAST
+                # logit position belonging to this request.
+                last_pos = offset + n - 1
+                tok = sample_token(
+                    logits[0:1, last_pos, :], req.sampling_params, req.output_ids
+                )
+                results.append(tok)
+            else:
+                #still prefilling, more chunks to come. no token to sample yet
+                results.append(None)
+            offset += n
+        return results
+
+    def _build_mixed_mask(self, num_new, cache_lens):
+        """
+        layout of the keys (along the K seq dim):
+          [req0_cached, req1_cached, ..., reqN_cached,
+           req0_new,    req1_new,    ..., reqN_new]
+        layout of the queries (along the Q seq dim):
+          [req0_new, req1_new, ..., reqN_new]
+
+        each query position attends to: all positions in its own request's cached portion
+        and its own request's new positions causally (k_pos <= q_pos)
+        """
+        total_new = sum(num_new)
+        total_cached = sum(cache_lens)
+
+        q_request = []
+        q_position = []
+        for r_idx, n in enumerate(num_new):
+            for p in range(n):
+                q_request.append(r_idx)
+                q_position.append(p)
+        q_request_t = torch.tensor(q_request, dtype=torch.long, device=self.device)
+        q_position_t = torch.tensor(q_position, dtype=torch.long, device=self.device)
+
+        k_cached_request = []
+        for r_idx, L in enumerate(cache_lens):
+            k_cached_request.extend([r_idx] * L)
+        k_cached_request_t = torch.tensor(
+            k_cached_request, dtype=torch.long, device=self.device,
+        )
+
+        # cached portion: true iff same request
+        cached_attend = q_request_t[:, None] == k_cached_request_t[None, :]
+        # New portion: same as Q (since new K and Q are the same positions).
+        # Attend if same request AND k position <= q position (causal).
+        same_req = q_request_t[:, None] == q_request_t[None, :]
+        causal = q_position_t[:, None] >= q_position_t[None, :]
+        new_attend = same_req & causal
+
+        attend = torch.cat([cached_attend, new_attend], dim=1)
+        mask = torch.where(attend, 0.0, float("-inf")).to(self.dtype)
+        return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, total_new, total_cached + total_new)
+
     def is_stop_token(self, token_id: int) -> bool:
         return token_id in self.stop_token_ids
