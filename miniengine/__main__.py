@@ -44,6 +44,17 @@ def parse_args() -> argparse.Namespace:
         default=16,
         help="Max concurrent requests in the scheduler",
     )
+    p.add_argument(
+        "--scheduling-mode",
+        type=str,
+        default="continuous",
+        choices=["naive", "static", "continuous"],
+        help=(
+            "naive: 1 request at a time (sequential baseline). "
+            "static: batched, drain-before-refill. "
+            "continuous: batched, admit-when-slot-free (default)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -61,7 +72,11 @@ def main() -> None:
     logger.info("Initializing engine  model=%s  dtype=%s", args.model, args.dtype)
 
     engine = Engine(model_path=args.model, dtype=dtype, device=args.device)
-    sched = Scheduler(engine=engine, max_running=args.max_running)
+    sched = Scheduler(
+        engine=engine,
+        max_running=args.max_running,
+        scheduling_mode=args.scheduling_mode,
+    )
 
     # Wire up the server module globals
     srv.engine = engine

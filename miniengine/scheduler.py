@@ -29,7 +29,16 @@ logger = logging.getLogger(__name__)
 
 class Scheduler:
     """
-    Naive FCFS scheduler — processes requests one at a time.
+    Continuous-batching FCFS scheduler.
+    continuous batching scheduler.
+
+    at each iteration step we fill our batch up to max_running,
+    prefill (currently blocking/non batched) them and then
+    batch decode all of this. this makes new equests join decode
+    in the same step as prefill.
+
+    we also bookeep finished jobs to make sure we can admit new jobs
+    later.
 
     Public API (thread-safe):
         add_request(req)   — enqueue a new request
@@ -40,9 +49,18 @@ class Scheduler:
         step()             — one full scheduling iteration
     """
 
-    def __init__(self, engine: Engine, max_running: int = 16):
+    def __init__(
+        self,
+        engine: Engine,
+        max_running: int = 16,
+        scheduling_mode: str = "continuous",
+    ):
+        assert scheduling_mode in ("naive", "static", "continuous"), (
+            f'please use a proper mode ("naive", "static", "continuous"'
+        )
         self.engine = engine
         self.max_running = max_running
+        self.scheduling_mode = scheduling_mode
 
         # Queues
         self.waiting: deque[Request] = deque()
@@ -101,35 +119,62 @@ class Scheduler:
 
     def step(self) -> list[Request]:
         """
-        One scheduling iteration — maximally naive.
+        one scheduling iteration of continuous batching.
 
-        Takes one request from the waiting queue, prefills it, and decodes
-        it to completion before moving on to the next request.  No batching,
-        no interleaving.
+        loop stpes:
+        1. admit up to max_running and prefill individually
+            a. will work on the abtched prefill+decode mixed inference later tiem permitting
+        2. decode batched
+        3. retire finished requests.
 
         Returns list of requests that finished in this step.
         """
         finished: list[Request] = []
 
-        # ── Pick one request ────────────────────────────────────────────
+        # decides based on mode what we can pick
+        if self.scheduling_mode == "naive":
+            slot_cap = 1
+        elif self.scheduling_mode == "static" and self.running:
+            slot_cap = 0  # only admit when running is done
+        else:
+            slot_cap = self.max_running
+
+        admitted: list[Request] = []
         with self._lock:
-            if not self.waiting:
-                return finished
-            req = self.waiting.popleft()
+            while (len(self.running) + len(admitted) < slot_cap) and self.waiting:
+                admitted.append(self.waiting.popleft())
 
-        # ── Prefill ─────────────────────────────────────────────────────
-        req.status = RequestStatus.RUNNING
-        token_id = self.engine.prefill(req)
-        req.output_ids.append(token_id)
-        self._stream_token(req, token_id)
-
-        # ── Decode until finished ───────────────────────────────────────
-        while not self._check_finished(req, token_id):
-            token_id = self.engine.decode_step(req)
+        # ── prefill each admitted request individually ──────────────────
+        for req in admitted:
+            req.status = RequestStatus.RUNNING
+            token_id = self.engine.prefill(req)
             req.output_ids.append(token_id)
             self._stream_token(req, token_id)
 
-        self._finish_request(req, finished)
+        # edge case of EOS at first end of prefil
+        # so making sure they do not enter the batched decode below.
+        for req in admitted:
+            if self._check_finished(req, req.output_ids[-1]):
+                self._finish_request(req, finished)
+            else:
+                self.running.append(req)
+
+        # batch call
+        if self.running:
+            next_tokens = self.engine.batched_decode(self.running)
+            for req, token_id in zip(self.running, next_tokens):
+                req.output_ids.append(token_id)
+                self._stream_token(req, token_id)
+
+        # retire finished stuff
+        still_running = []
+        for req in self.running:
+            if self._check_finished(req, req.output_ids[-1]):
+                self._finish_request(req, finished)
+            else:
+                still_running.append(req)
+        self.running = still_running
+
         return finished
 
     # ── Helpers ─────────────────────────────────────────────────────────
