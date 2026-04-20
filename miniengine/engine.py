@@ -322,10 +322,22 @@ class Engine:
             if L < max_cache_len:
                 mask[i, :, :, L:max_cache_len] = float("-inf")
 
+        # ── TIMING DIAGNOSTIC ──────────────────────────────────────────
+        # Wraps the three big regions: forward, pool writes, sampling.
+        # Logs only when batch >= 4 to avoid spamming for single-request cases.
+        import time as _time
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t0 = _time.perf_counter()
+
         # forward pass
         logits, new_kv_caches = self.model(
             input_ids, position_ids, batched_kv_caches, attention_mask=mask
         )
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t_forward = _time.perf_counter()
 
         # scatter the new kv token back to each slot's cache_len position.
         slots_t = torch.arange(batch_size, dtype=torch.long, device=self.device)
@@ -340,6 +352,10 @@ class Engine:
         for r in sorted_reqs:
             r.cache_len += 1
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t_pool = _time.perf_counter()
+
         # Sample in sorted order, then map back to caller's input order.
         sorted_tokens = [
             sample_token(logits[i:i+1, -1, :], r.sampling_params, r.output_ids)
@@ -348,6 +364,20 @@ class Engine:
         result = [None] * len(requests)
         for sorted_i, orig_i in enumerate(order):
             result[orig_i] = sorted_tokens[sorted_i]
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t_end = _time.perf_counter()
+
+        if batch_size >= 4:
+            logger.info(
+                "batched_decode: batch=%d  forward=%.1fms  pool_writes=%.1fms  sampling=%.1fms  total=%.1fms",
+                batch_size,
+                (_t_forward - _t0) * 1000,
+                (_t_pool - _t_forward) * 1000,
+                (_t_end - _t_pool) * 1000,
+                (_t_end - _t0) * 1000,
+            )
         return result
 
     @torch.inference_mode()
