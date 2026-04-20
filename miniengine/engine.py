@@ -312,15 +312,22 @@ class Engine:
                 pool_v[:batch_size, :, :max_cache_len, :],
             ))
 
-        # mask: (batch_size, 1, 1, max_cache_len + 1). +1 is the new token slot.
-        mask = torch.zeros(
-            batch_size, 1, 1, max_cache_len + 1,
-            dtype=self.dtype, device=self.device,
-        )
-        # mask so attention score is 0 
-        for i, L in enumerate(cache_lens):
-            if L < max_cache_len:
-                mask[i, :, :, L:max_cache_len] = float("-inf")
+        # Build mask only if cache lengths are non-uniform. When they're uniform
+        # (common in steady-state decode when all requests started together),
+        # the mask's -inf regions are empty — the mask is all zeros, equivalent
+        # to passing None. Skipping it lets SDPA pick a faster kernel backend
+        # (mem-eff instead of math) on T4 / non-FA-2 hardware.
+        uniform_lens = all(L == max_cache_len for L in cache_lens)
+        if uniform_lens:
+            mask = None
+        else:
+            mask = torch.zeros(
+                batch_size, 1, 1, max_cache_len + 1,
+                dtype=self.dtype, device=self.device,
+            )
+            for i, L in enumerate(cache_lens):
+                if L < max_cache_len:
+                    mask[i, :, :, L:max_cache_len] = float("-inf")
 
         # ── TIMING DIAGNOSTIC ──────────────────────────────────────────
         # Wraps the three big regions: forward, pool writes, sampling.
@@ -369,15 +376,15 @@ class Engine:
             torch.cuda.synchronize()
         _t_end = _time.perf_counter()
 
-        if batch_size >= 4:
-            logger.info(
-                "batched_decode: batch=%d  forward=%.1fms  pool_writes=%.1fms  sampling=%.1fms  total=%.1fms",
-                batch_size,
-                (_t_forward - _t0) * 1000,
-                (_t_pool - _t_forward) * 1000,
-                (_t_end - _t_pool) * 1000,
-                (_t_end - _t0) * 1000,
-            )
+        # Log every call so we can see per-batch-size scaling in one bench run.
+        logger.info(
+            "batched_decode: batch=%d  forward=%.1fms  pool_writes=%.1fms  sampling=%.1fms  total=%.1fms",
+            batch_size,
+            (_t_forward - _t0) * 1000,
+            (_t_pool - _t_forward) * 1000,
+            (_t_end - _t_pool) * 1000,
+            (_t_end - _t0) * 1000,
+        )
         return result
 
     @torch.inference_mode()
